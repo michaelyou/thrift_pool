@@ -10,7 +10,7 @@ manage and reuse connections.
 Install the package with:
 
 ```bash
-go get github.com/fatih/pool
+go get github.com/michaelyou/pool
 ```
 
 Please vendor the package with one of the releases: https://github.com/fatih/pool/releases.
