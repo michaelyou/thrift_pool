@@ -1,23 +1,26 @@
 package pool
 
 import (
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"git.apache.org/thrift.git/lib/go/thrift"
 )
 
 type Connection struct {
-	cp        *connectionPool
-	createdAt time.Time
-
 	sync.Mutex
-	net.Conn
-	closed      bool
-	finalClosed bool
+
+	cp           *connectionPool
+	socket       *thrift.TSocket // use this to close this connection
+	ThriftClient interface{}     // this is what we return in Get
+	closed       bool
+	finalClosed  bool
 
 	// guard by cp.mu
 	inUse bool
+
+	createdAt time.Time
 }
 
 func (c *Connection) Release(err error) {
@@ -26,6 +29,7 @@ func (c *Connection) Release(err error) {
 
 func (c *Connection) Close() {
 	withLock(c, func() {
+		c.socket.Close()
 		c.finalClosed = true
 		c.cp.mu.Lock()
 		c.cp.numOpen--

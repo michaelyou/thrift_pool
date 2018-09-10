@@ -1,55 +1,48 @@
-# Pool [![GoDoc](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)](https://godoc.org/github.com/michaelyou/pool) [![Build Status](http://img.shields.io/travis/fatih/pool.svg?style=flat-square)](https://travis-ci.org/michael/pool)
+# Pool [![GoDoc](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)](https://godoc.org/github.com/michaelyou/thrift_pool) [![Build Status](http://img.shields.io/travis/fatih/pool.svg?style=flat-square)](https://travis-ci.org/michael/thrift_pool)
 
 
-Pool is a thread safe connection pool for net.Conn interface. It can be used to
-manage and reuse connections.
+实现了一个thrift client连接池
 
-
-## Install and Usage
-
-Install the package with:
+## 安装 
 
 ```bash
-go get github.com/michaelyou/pool
+go get github.com/michaelyou/thrift_pool
 ```
-
-Please vendor the package with one of the releases: https://github.com/fatih/pool/releases.
-`master` branch is **development** branch and will contain always the latest changes.
-
 
 ## Example
 
 ```go
-// create a factory() to be used with channel based pool
-factory    := func() (net.Conn, error) { return net.Dial("tcp", "127.0.0.1:4000") }
+import (
+    "github.com/michaelyou/thrift_pool"
+    "thrift_practise/gen-go/tutorial"
+)
 
-// create a new channel based pool with an initial capacity of 5 and maximum
-// capacity of 30. The factory will create 5 initial connections and put it
-// into the pool.
-p, err := pool.NewChannelPool(5, 30, factory)
-
-// now you can get a connection from the pool, if there is no connection
-// available it will create a new one via the factory function.
-conn, err := p.Get()
-
-// do something with conn and put it back to the pool by closing the connection
-// (this doesn't close the underlying connection instead it's putting it back
-// to the pool).
-conn.Close()
-
-// close the underlying connection instead of returning it to pool
-// it is useful when acceptor has already closed connection and conn.Write() returns error
-if pc, ok := conn.(*pool.PoolConn); ok {
-  pc.MarkUnusable()
-  pc.Close()
+// 创建一个函数用来生成需要的thrift client
+func NewClient(ctx context.Context, c *thrift.TStandardClient) interface{} {
+    return tutorial.NewCalculatorClient(c)
 }
 
-// close pool any time you want, this closes all the connections inside a pool
-p.Close()
+ctx := context.Background()
+cp, err := pool.NewConnectionPool(ctx, "127.0.0.1:9090", "binary", false, false, NewClient)
+// 意义同database/sql
+cp.SetMaxOpenConns(10)
+cp.SetMaxIdleConns(5)
+// cp.SetConnMaxLifetime(60 * time.Second) 可以设置连接的过期时间，过期的连接将被回收，生成新的连接，如果不设置，将不对连接的过期进行检查
+if err != nil {
+	fmt.Println("new connection pool error", err)
+	return err
+}
 
-// currently available connections in the pool
-current := p.Len()
-```
+// 取出一个连接
+conn, err := cp.Get(ctx, pool.CachedOrNewConn)
+if err != nil {
+	fmt.Println("get conn error", err)
+}
+// 从conn拿出client，client是一个interface{}，需要type assertions
+client := conn.ThriftClient
+handleClient(client.(*tutorial.CalculatorClient))
+// 千万不要忘记将连接重新放回池中
+conn.Release(nil)
 
 ## License
 

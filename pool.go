@@ -3,10 +3,13 @@ package pool
 import (
 	"context"
 	"errors"
-	// "fmt"
-	"net"
+	"fmt"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
+
+	"git.apache.org/thrift.git/lib/go/thrift"
 )
 
 var nowFunc = time.Now
@@ -14,6 +17,11 @@ var nowFunc = time.Now
 // connectionPool implements the Pool interface based on buffered channels.
 type connectionPool struct {
 	numClosed uint64
+
+	// thrift conf
+	addrs            string // server地址，逗号分隔，eg: 127.0.0.1:2000,127.0.0.2:3000
+	protocolFactory  thrift.TProtocolFactory
+	transportFactory thrift.TTransportFactory
 
 	mu           sync.Mutex // protects following fields
 	freeConn     []*Connection
@@ -31,7 +39,7 @@ type connectionPool struct {
 
 	stop func()
 
-	// net.Conn generator
+	// connection generator
 	factory Factory
 }
 
@@ -41,7 +49,7 @@ type connRequest struct {
 }
 
 // Factory is a function to create new connections.
-type Factory func(ctx context.Context) (net.Conn, error)
+type Factory func(ctx context.Context, c *thrift.TStandardClient) interface{}
 
 // This is the size of the connectionOpener request chan (connectionPool.openerCh).
 // This value should be larger than the maximum typical value
@@ -60,19 +68,86 @@ const (
 	CachedOrNewConn
 )
 
-func NewConnectionPool(ctx context.Context, factory Factory) *connectionPool {
+/*
+@addrs: server地址，逗号分隔，eg: 127.0.0.1:2000,127.0.0.2:3000
+@protocol: Specify the protocol (binary, compact, json, simplejson)
+@frame: Use framed transport
+@buffered: Use buffered transport
+*/
+func NewConnectionPool(ctx context.Context, addrs, protocol string, frame, buffered bool, factory Factory) (*connectionPool, error) {
+	var protocolFactory thrift.TProtocolFactory
+	switch protocol {
+	case "compact":
+		protocolFactory = thrift.NewTCompactProtocolFactory()
+	case "simplejson":
+		protocolFactory = thrift.NewTSimpleJSONProtocolFactory()
+	case "json":
+		protocolFactory = thrift.NewTJSONProtocolFactory()
+	case "binary", "":
+		protocolFactory = thrift.NewTBinaryProtocolFactoryDefault()
+	default:
+		return nil, errors.New("Invalid protocol specified, support (binary, compact, json, simplejson)")
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
+	var transportFactory thrift.TTransportFactory
+	if buffered {
+		transportFactory = thrift.NewTBufferedTransportFactory(8192)
+	} else {
+		transportFactory = thrift.NewTTransportFactory()
+	}
+	if frame {
+		transportFactory = thrift.NewTFramedTransportFactory(transportFactory)
+	}
 
 	cp := &connectionPool{
-		openerCh:     make(chan struct{}, connectionRequestQueueSize),
-		connRequests: make(map[uint64]chan connRequest),
-		stop:         cancel,
-		factory:      factory,
+		openerCh:         make(chan struct{}, connectionRequestQueueSize),
+		connRequests:     make(map[uint64]chan connRequest),
+		stop:             cancel,
+		factory:          factory,
+		addrs:            addrs,
+		protocolFactory:  protocolFactory,
+		transportFactory: transportFactory,
 	}
 
 	go cp.connectionOpener(ctx)
+	// go cp.monitorConn()
 
-	return cp
+	return cp, nil
+}
+
+func (cp *connectionPool) monitorConn() {
+	for _ = range time.Tick(time.Millisecond * 1) {
+		fmt.Printf("numclosed:%d, numOpen:%d, numFree:%d", cp.numClosed, cp.numOpen, len(cp.freeConn))
+	}
+}
+
+func (cp *connectionPool) newConnection(ctx context.Context) (*Connection, error) {
+	addrs := strings.Split(cp.addrs, ",")
+	if len(addrs) == 0 {
+		return nil, errors.New("thrift server addrs shouldn't be empty")
+	}
+	addr := addrs[rand.Intn(len(addrs))]
+	socket, err := thrift.NewTSocket(addr)
+
+	if err != nil {
+		return nil, fmt.Errorf("Error opening socket: %s", err)
+	}
+	transport, err := cp.transportFactory.GetTransport(socket)
+	if err != nil {
+		return nil, err
+	}
+	if err := transport.Open(); err != nil {
+		return nil, err
+	}
+	iprot := cp.protocolFactory.GetProtocol(transport)
+	oprot := cp.protocolFactory.GetProtocol(transport)
+	return &Connection{
+		cp:           cp,
+		ThriftClient: cp.factory(ctx, thrift.NewTStandardClient(iprot, oprot)),
+		socket:       socket,
+		createdAt:    nowFunc(),
+		inUse:        true}, nil
 }
 
 func (cp *connectionPool) Get(ctx context.Context, strategy connReuseStrategy) (*Connection, error) {
@@ -96,7 +171,7 @@ func (cp *connectionPool) Get(ctx context.Context, strategy connReuseStrategy) (
 
 		conn.inUse = true
 		cp.mu.Unlock()
-		if conn.IsExpired(lifetime) {
+		if lifetime != 0 && conn.IsExpired(lifetime) {
 			conn.Close()
 			return nil, ErrBadConn
 		}
@@ -126,7 +201,7 @@ func (cp *connectionPool) Get(ctx context.Context, strategy connReuseStrategy) (
 			if !ok {
 				return nil, errPoolClosed
 			}
-			if ret.err == nil && ret.conn.IsExpired(lifetime) {
+			if ret.err == nil && lifetime != 0 && ret.conn.IsExpired(lifetime) {
 				ret.conn.Close()
 				return nil, ErrBadConn
 			}
@@ -134,10 +209,10 @@ func (cp *connectionPool) Get(ctx context.Context, strategy connReuseStrategy) (
 		}
 	}
 
-	// 没有设置maxOpen也会走到这里，maxOpen=0
+	// 没有设置maxOpen时，maxOpen=0，也会走到这里
 	cp.numOpen++
 	cp.mu.Unlock()
-	ci, err := cp.factory(ctx)
+	ci, err := cp.newConnection(ctx)
 	if err != nil {
 		cp.mu.Lock()
 		cp.numOpen--
@@ -145,13 +220,7 @@ func (cp *connectionPool) Get(ctx context.Context, strategy connReuseStrategy) (
 		cp.mu.Unlock()
 		return nil, err
 	}
-	conn := &Connection{
-		cp:        cp,
-		createdAt: nowFunc(),
-		Conn:      ci,
-		inUse:     true,
-	}
-	return conn, nil
+	return ci, nil
 }
 
 func (cp *connectionPool) Close() error {
@@ -220,7 +289,7 @@ func (cp *connectionPool) openNewConnection(ctx context.Context) {
 	// maybeOpenNewConnctions has already executed cp.numOpen++ before it sent
 	// on cp.openerCh. This function must execute cp.numOpen-- if the
 	// connection fails or is closed before returning.
-	ci, err := cp.factory(ctx)
+	ci, err := cp.newConnection(ctx)
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
@@ -238,11 +307,7 @@ func (cp *connectionPool) openNewConnection(ctx context.Context) {
 		return
 	}
 
-	c := &Connection{
-		createdAt: nowFunc(),
-		Conn:      ci,
-	}
-	if !cp.putConnLocked(c, err) {
+	if !cp.putConnLocked(ci, err) {
 		cp.numOpen--
 		ci.Close()
 	}
@@ -274,7 +339,7 @@ func (cp *connectionPool) putConn(conn *Connection, err error) {
 	}
 }
 
-// 如果某个方法当且仅当会在加锁的情况下被调用，那么就会给这个方法加上Locked的后缀，方便开发者理解
+// 如果某个方法当且仅当会在加锁的情况下被调用，那么就会给这个方法加上Locked的后缀
 func (cp *connectionPool) putConnLocked(conn *Connection, err error) bool {
 	if cp.closed {
 		return false
