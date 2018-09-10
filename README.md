@@ -43,6 +43,7 @@ client := conn.ThriftClient
 handleClient(client.(*tutorial.CalculatorClient))
 // 千万不要忘记将连接重新放回池中
 conn.Release(nil)
+```
 
 ## License
 
